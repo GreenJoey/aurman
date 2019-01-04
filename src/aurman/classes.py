@@ -1,12 +1,14 @@
+import fnmatch
 import logging
 import os
+import re
 from enum import Enum, auto
 from subprocess import run, PIPE, DEVNULL
 from typing import Sequence, List, Tuple, Set, Union, Dict, Iterable
 
 from pycman.config import PacmanConfig
 
-from aurman.aur_utilities import is_devel, get_aur_info
+from aurman.aur_utilities import is_devel, get_aur_info, AurVars
 from aurman.coloring import aurman_status, aurman_note, aurman_error, aurman_question, Colors
 from aurman.own_exceptions import InvalidInput, ConnectionProblem
 from aurman.parsing_config import packages_from_other_sources
@@ -80,7 +82,8 @@ class DepAlgoCycle(DepAlgoFoundProblems):
 
     def __repr__(self):
         return "Dep cycle: {}".format(
-            " -> ".join([Colors.BOLD(Colors.LIGHT_MAGENTA(package)) for package in self.cycle_packages]))
+            " -> ".join([Colors.BOLD(Colors.LIGHT_MAGENTA(package)) for package in self.cycle_packages])
+        )
 
     def __eq__(self, other):
         return isinstance(other, self.__class__) and frozenset(self.cycle_packages) == frozenset(other.cycle_packages)
@@ -102,20 +105,23 @@ class DepAlgoConflict(DepAlgoFoundProblems):
 
     def __repr__(self):
         return_string = "Conflicts between: {}".format(
-            ", ".join([Colors.BOLD(Colors.LIGHT_MAGENTA(package)) for package in self.conflicting_packages]))
+            ", ".join([Colors.BOLD(Colors.LIGHT_MAGENTA(package)) for package in self.conflicting_packages])
+        )
 
         if self.additional_message:
             return_string += "\n" + self.additional_message
 
         for way_to_conflict in self.ways_to_conflict:
-            return_string += "\nWay to package {}: {}".format(way_to_conflict[len(way_to_conflict) - 1], " -> ".join(
-                [Colors.BOLD(Colors.LIGHT_MAGENTA(package)) for package in way_to_conflict]))
+            return_string += "\nWay to package {}: {}".format(
+                way_to_conflict[len(way_to_conflict) - 1],
+                " -> ".join([Colors.BOLD(Colors.LIGHT_MAGENTA(package)) for package in way_to_conflict])
+            )
 
         return return_string
 
     def __eq__(self, other):
-        return isinstance(other, self.__class__) and frozenset(self.conflicting_packages) == frozenset(
-            other.conflicting_packages)
+        return isinstance(other, self.__class__) \
+               and frozenset(self.conflicting_packages) == frozenset(other.conflicting_packages)
 
     def __hash__(self):
         return hash(frozenset(self.conflicting_packages))
@@ -132,12 +138,14 @@ class DepAlgoNotProvided(DepAlgoFoundProblems):
         self.package: 'Package' = package
 
     def __repr__(self):
-        return "Not provided: {} but needed by {}".format(Colors.BOLD(Colors.LIGHT_MAGENTA(self.dep_not_provided)),
-                                                          Colors.BOLD(Colors.LIGHT_MAGENTA(self.package)))
+        return "Not provided: {} but needed by {}".format(
+            Colors.BOLD(Colors.LIGHT_MAGENTA(self.dep_not_provided)), Colors.BOLD(Colors.LIGHT_MAGENTA(self.package))
+        )
 
     def __eq__(self, other):
-        return isinstance(other,
-                          self.__class__) and self.dep_not_provided == other.dep_not_provided and self.package == other.package
+        return isinstance(other, self.__class__) \
+               and self.dep_not_provided == other.dep_not_provided \
+               and self.package == other.package
 
     def __hash__(self):
         return hash((self.dep_not_provided, self.package))
@@ -150,8 +158,17 @@ class Package:
     # default editor path
     default_editor_path = os.environ.get("VISUAL", os.environ.get("EDITOR", os.path.join("/usr", "bin", "nano")))
     # directory of the cache
-    cache_dir = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser(os.path.join("~", ".cache"))),
-                             "aurman")
+    cache_dir = os.path.join(
+        os.environ.get("XDG_CACHE_HOME", os.path.expanduser(os.path.join("~", ".cache"))),
+        "aurman"
+    )
+    # assume that dependencies are fulfilled, if the exact version of the provider is not known,
+    # but a specific version is needed
+    # default is FALSE, may be set to TRUE via a command line flag
+    optimistic_versioning: bool = False
+    # ignore all versioned dependencies
+    # default is FALSE, may be set to TRUE via a command line flag
+    ignore_versioning: bool = False
 
     @staticmethod
     def get_packages_from_aur(packages_names: Sequence[str]) -> List['Package']:
@@ -194,23 +211,49 @@ class Package:
         return return_list
 
     @staticmethod
+    def getPGPKeys(pkgbuild_path: str) -> List[str]:
+        """
+        returns pgp keys from a pkgbuild
+
+        :param pkgbuild_path: the path to the pkgbuild
+        :return: the keys contained in the pkgbuild
+        """
+
+        if not os.path.isfile(pkgbuild_path):
+            logging.error("{} not found".format(pkgbuild_path))
+            raise InvalidInput("{} not found".format(pkgbuild_path))
+
+        with open(pkgbuild_path, 'r') as f:
+            pkgbuild_content: str = f.read().strip()
+
+        pkgbuild_no_comments: str = re.sub(r'#.*$', '', pkgbuild_content, flags=re.MULTILINE)
+        validpgp_array: List[str] = re.findall(r'validpgpkeys[ ]*=[ ]*\([^)]*\)', pkgbuild_no_comments)
+        if not validpgp_array:
+            return []
+
+        return re.findall(r'[A-F0-9]{40}', validpgp_array[-1])
+
+    @staticmethod
     def get_ignored_packages_names(ign_packages_names: Sequence[str], ign_groups_names: Sequence[str],
-                                   upstream_system: 'System') -> Set[str]:
+                                   upstream_system: 'System', installed_system: 'System',
+                                   do_everything: bool = False) -> Set[str]:
         """
         Returns the names of the ignored packages from the pacman.conf + the names from the command line
 
         :param ign_packages_names:  Names of packages to ignore
         :param ign_groups_names:    Names of groups to ignore
         :param upstream_system:     System containing the upstream packages
+        :param installed_system:    System containing the installed packages
+        :param do_everything:       if --do_everything
         :return:                    a set containing the names of the ignored packages
         """
         handler = PacmanConfig(conf="/etc/pacman.conf").initialize_alpm()
 
-        # ignored packages names
-        return_set = set(handler.ignorepkgs)
+        # ignored packages names - may contain glob patterns
+        names_to_ignore = set(handler.ignorepkgs)
         for ign_packages_name in ign_packages_names:
             for name in ign_packages_name.split(","):
-                return_set.add(name)
+                names_to_ignore.add(name)
 
         # ignored groups names
         ignored_groups_names = set(handler.ignoregrps)
@@ -218,12 +261,26 @@ class Package:
             for name in ign_groups_name.split(","):
                 ignored_groups_names.add(name)
 
+        # contains the concrete packages names to ignore
+        return_set = set()
+
+        # check globbing
+        packages_names = [package_name for package_name in upstream_system.all_packages_dict]
+        for possible_glob in names_to_ignore:
+            return_set |= set(fnmatch.filter(packages_names, possible_glob))
+        # allow non upstream packages to be ignored, too - needed for correct replaces behavior
+        if do_everything:
+            packages_names = [package_name for package_name in installed_system.all_packages_dict]
+            for possible_glob in names_to_ignore:
+                return_set |= set(fnmatch.filter(packages_names, possible_glob))
+
         if not ignored_groups_names:
             return return_set
 
         # fetch packages names of groups to ignore
-        for package_name in upstream_system.all_packages_dict:
+        for package_name in packages_names:
             package = upstream_system.all_packages_dict[package_name]
+            # check groups
             for package_group in package.groups:
                 if package_group in ignored_groups_names:
                     return_set.add(package_name)
@@ -253,12 +310,12 @@ class Package:
         :return:                    List containing the packages
         """
         if "Q" in expac_operation:
-            formatting = list("nvDHoPReGw")
+            formatting = list("nvDHoPTeGw")
             repos = []
             repo_dict = {}
         else:
             assert "S" in expac_operation
-            formatting = list("nvDHoPReGr")
+            formatting = list("nvDHoPTeGr")
             repos = Package.get_known_repos()
             # packages the user wants to install from another repo
             repo_dict = packages_from_other_sources()[1]
@@ -322,41 +379,52 @@ class Package:
         # check if all repos the user gave us are actually known
         for repo_package_name in repo_dict:
             if repo_package_name not in return_dict:
-                aurman_error("Package {} "
-                             "not known in any repo".format(Colors.BOLD(Colors.LIGHT_MAGENTA(repo_package_name))))
-                raise InvalidInput("Package {} "
-                                   "not known in any repo".format(Colors.BOLD(Colors.LIGHT_MAGENTA(repo_package_name))))
+                aurman_error(
+                    "Package {} not known in any repo".format(
+                        Colors.BOLD(Colors.LIGHT_MAGENTA(repo_package_name))
+                    )
+                )
+                raise InvalidInput(
+                    "Package {} not known in any repo".format(
+                        Colors.BOLD(Colors.LIGHT_MAGENTA(repo_package_name))
+                    )
+                )
 
             package_repo = return_dict[repo_package_name].repo
             if package_repo != repo_dict[repo_package_name]:
-                aurman_error("Package {} not found in repo {}"
-                             "".format(Colors.BOLD(Colors.LIGHT_MAGENTA(repo_package_name)),
-                                       Colors.BOLD(Colors.LIGHT_MAGENTA(repo_dict[repo_package_name]))))
-                raise InvalidInput("Package {} not found in repo {}"
-                                   "".format(Colors.BOLD(Colors.LIGHT_MAGENTA(repo_package_name)),
-                                             Colors.BOLD(Colors.LIGHT_MAGENTA(repo_dict[repo_package_name]))))
+                aurman_error(
+                    "Package {} not found in repo {}".format(
+                        Colors.BOLD(Colors.LIGHT_MAGENTA(repo_package_name)),
+                        Colors.BOLD(Colors.LIGHT_MAGENTA(repo_dict[repo_package_name]))
+                    )
+                )
+                raise InvalidInput(
+                    "Package {} not found in repo {}".format(
+                        Colors.BOLD(Colors.LIGHT_MAGENTA(repo_package_name)),
+                        Colors.BOLD(Colors.LIGHT_MAGENTA(repo_dict[repo_package_name]))
+                    )
+                )
 
         return list(return_dict.values())
 
-    def __init__(self, name: str, version: str, depends: Sequence[str] = None, conflicts: Sequence[str] = None,
-                 optdepends: Sequence[str] = None, provides: Sequence[str] = None, replaces: Sequence[str] = None,
-                 pkgbase: str = None, install_reason: str = None, makedepends: Sequence[str] = None,
-                 checkdepends: Sequence[str] = None, type_of: PossibleTypes = None, repo: str = None,
-                 groups: Sequence[str] = None):
-        self.name = name  # %n
-        self.version = version  # %v
-        self.depends = depends  # %D
-        self.conflicts = conflicts  # %H
-        self.optdepends = optdepends  # %o
-        self.provides = provides  # %P
-        self.replaces = replaces  # %R
-        self.pkgbase = pkgbase  # %e
-        self.install_reason = install_reason  # %w (only with -Q)
-        self.makedepends = makedepends  # aur only
-        self.checkdepends = checkdepends  # aur only
-        self.type_of = type_of  # PossibleTypes Enum value
-        self.repo = repo  # %r (only useful for upstream repo packages)
-        self.groups = groups  # %G
+    def __init__(
+            self, name, version, depends=None, conflicts=None, optdepends=None, provides=None, replaces=None,
+            pkgbase=None, install_reason=None, makedepends=None, checkdepends=None, type_of=None, repo=None, groups=None
+    ):
+        self.name: str = name  # %n
+        self.version: str = version  # %v
+        self.depends: Sequence[str] = depends  # %D
+        self.conflicts: Sequence[str] = conflicts  # %H
+        self.optdepends: Sequence[str] = optdepends  # %o
+        self.provides: Sequence[str] = provides  # %P
+        self.replaces: Sequence[str] = replaces  # %T
+        self.pkgbase: str = pkgbase  # %e
+        self.install_reason: str = install_reason  # %w (only with -Q)
+        self.makedepends: Sequence[str] = makedepends  # aur only
+        self.checkdepends: Sequence[str] = checkdepends  # aur only
+        self.type_of: PossibleTypes = type_of  # PossibleTypes Enum value
+        self.repo: str = repo  # %r (only useful for upstream repo packages)
+        self.groups: Sequence[str] = groups  # %G
 
     def __eq__(self, other):
         return isinstance(other, self.__class__) and self.name == other.name and self.version == other.version
@@ -565,8 +633,10 @@ class Package:
                     # and yield an empty found_problems set instance
                     found_problems.clear()
                     current_solutions.extend(
-                        dep_provider.solutions_for_dep_problem(solution, found_problems, installed_system,
-                                                               upstream_system, deps_to_deep_check))
+                        dep_provider.solutions_for_dep_problem(
+                            solution, found_problems, installed_system, upstream_system, deps_to_deep_check
+                        )
+                    )
                     # save the new problems
                     new_problems.append(set(found_problems))
                     # remove added things
@@ -645,9 +715,9 @@ class Package:
             # if self cannot be added, this solution
             # is clearly not valid
             if self.name not in new_system.all_packages_dict:
-                additional_message = "Tried to install {}, " \
-                                     "but it was not possible." \
-                                     "".format(Colors.BOLD(Colors.LIGHT_MAGENTA(self.name)))
+                additional_message = "Tried to install {}, but it was not possible.".format(
+                    Colors.BOLD(Colors.LIGHT_MAGENTA(self.name))
+                )
                 is_possible = False
             else:
                 is_possible = True
@@ -662,10 +732,10 @@ class Package:
                 if not is_possible:
                     break
                 if not new_system.provided_by(dep):
-                    additional_message = "While trying to install {}, " \
-                                         "the needed dependency {} has been removed." \
-                                         "".format(Colors.BOLD(Colors.LIGHT_MAGENTA(self.name))
-                                                   , Colors.BOLD(Colors.LIGHT_MAGENTA(dep)))
+                    additional_message = "While trying to install {}, the needed dependency {} has been removed".format(
+                        Colors.BOLD(Colors.LIGHT_MAGENTA(self.name)),
+                        Colors.BOLD(Colors.LIGHT_MAGENTA(dep))
+                    )
                     is_possible = False
                     break
 
@@ -678,8 +748,8 @@ class Package:
                     additional_message = "The package {} had to remain installed, " \
                                          "but has been removed.\n" \
                                          "The package which lead to the removal is {}" \
-                                         "".format(Colors.BOLD(Colors.LIGHT_MAGENTA(package.name))
-                                                   , Colors.BOLD(Colors.LIGHT_MAGENTA(self.name)))
+                                         "".format(Colors.BOLD(Colors.LIGHT_MAGENTA(package.name)),
+                                                   Colors.BOLD(Colors.LIGHT_MAGENTA(self.name)))
 
                     break
 
@@ -765,8 +835,10 @@ class Package:
                     for solution in current_solutions:
                         solution.dict_call_as_needed = {package.name: True}
                         new_solutions.extend(
-                            package.solutions_for_dep_problem(solution, found_problems, installed_system,
-                                                              upstream_system, deps_to_deep_check))
+                            package.solutions_for_dep_problem(
+                                solution, found_problems, installed_system, upstream_system, deps_to_deep_check
+                            )
+                        )
                     current_solutions = new_solutions
 
             # now for all packages together
@@ -778,8 +850,10 @@ class Package:
                 new_solutions = []
                 for solution in current_solutions:
                     new_solutions.extend(
-                        package.solutions_for_dep_problem(solution, found_problems, installed_system, upstream_system,
-                                                          deps_to_deep_check))
+                        package.solutions_for_dep_problem(
+                            solution, found_problems, installed_system, upstream_system, deps_to_deep_check
+                        )
+                    )
                 current_solutions = new_solutions
 
             # delete invalid solutions
@@ -805,9 +879,11 @@ class Package:
 
         # output for user
         if found_problems and not current_solutions:
-            aurman_error("While searching for solutions the following errors occurred:\n"
-                         "{}\n".format("\n".join([aurman_note(problem, False, False) for problem in found_problems])),
-                         True)
+            aurman_error(
+                "While searching for solutions the following errors occurred:\n{}\n".format(
+                    "\n".join([aurman_note(problem, False, False) for problem in found_problems])
+                ), True
+            )
 
         return [solution.packages_in_solution for solution in current_solutions]
 
@@ -815,41 +891,58 @@ class Package:
         """
         Fetches the current git aur repo changes for this package
         """
-        import aurman.aur_utilities
 
         package_dir = os.path.join(Package.cache_dir, self.pkgbase)
 
         # check if repo has ever been fetched
         if os.path.isdir(package_dir):
-            if run("git fetch", shell=True, cwd=package_dir).returncode != 0:
-                logging.error("git fetch of {} failed".format(self.name))
-                raise ConnectionProblem("git fetch of {} failed".format(self.name))
+            if run(["git", "fetch"], cwd=package_dir).returncode != 0:
+                logging.error("git fetch failed in directory {}".format(package_dir))
+                raise ConnectionProblem("git fetch failed in directory {}".format(package_dir))
 
-            head = run("git rev-parse HEAD", shell=True, stdout=PIPE, universal_newlines=True,
-                       cwd=package_dir).stdout.strip()
-            u = run("git rev-parse @{u}", shell=True, stdout=PIPE, universal_newlines=True,
-                    cwd=package_dir).stdout.strip()
+            head = run(
+                ["git", "rev-parse", "HEAD"], stdout=PIPE, universal_newlines=True, cwd=package_dir
+            ).stdout.strip()
+            u = run(
+                ["git", "rev-parse", "@{u}"], stdout=PIPE, universal_newlines=True, cwd=package_dir
+            ).stdout.strip()
 
             # if new sources available
             if head != u:
-                if run("git reset --hard HEAD && git pull", shell=True, stdout=DEVNULL, stderr=DEVNULL,
-                       cwd=package_dir).returncode != 0:
-                    logging.error("sources of {} could not be fetched".format(self.name))
-                    raise ConnectionProblem("sources of {} could not be fetched".format(self.name))
+                reset_return = run(
+                    ["git", "reset", "--hard", "HEAD"],
+                    stdout=DEVNULL, stderr=PIPE, cwd=package_dir, universal_newlines=True
+                )
+                if reset_return.returncode != 0:
+                    print(reset_return.stderr)
+                    logging.error("git reset failed in directory {}".format(package_dir))
+                    raise InvalidInput("git reset failed in directory {}".format(package_dir))
+
+                pull_return = run(
+                    ["git", "pull"],
+                    stdout=DEVNULL, stderr=PIPE, cwd=package_dir, universal_newlines=True
+                )
+                if pull_return.returncode != 0:
+                    print(pull_return.stderr)
+                    logging.error("git pull failed in directory {}".format(package_dir))
+                    raise ConnectionProblem("git pull failed in directory {}".format(package_dir))
 
         # repo has never been fetched
         else:
             # create package dir
-            if run("install -dm700 '{}'".format(package_dir),
-                   shell=True, stdout=DEVNULL, stderr=DEVNULL).returncode != 0:
-                logging.error("Creating package dir of {} failed".format(self.name))
-                raise InvalidInput("Creating package dir of {} failed".format(self.name))
+            try:
+                os.makedirs(package_dir, mode=0o700, exist_ok=True)
+            except OSError:
+                logging.error("Creating package dir {} failed".format(package_dir))
+                raise InvalidInput("Creating package dir {} failed".format(package_dir))
 
             # clone repo
-            if run("git clone {}/{}.git".format(aurman.aur_utilities.aur_domain, self.pkgbase), shell=True,
-                   cwd=Package.cache_dir).returncode != 0:
-                logging.error("Cloning repo of {} failed".format(self.name))
-                raise ConnectionProblem("Cloning repo of {} failed".format(self.name))
+            if run(
+                    ["git", "clone", "{}/{}.git".format(AurVars.aur_domain, self.pkgbase)],
+                    cwd=Package.cache_dir
+            ).returncode != 0:
+                logging.error("Cloning repo of {} failed in directory {}".format(self.name, package_dir))
+                raise ConnectionProblem("Cloning repo of {} failed in directory {}".format(self.name, package_dir))
 
     def search_and_fetch_pgp_keys(self, fetch_always: bool = False, keyserver: str = None):
         """
@@ -865,29 +958,40 @@ class Package:
             logging.error("Package dir of {} does not exist".format(self.name))
             raise InvalidInput("Package dir of {} does not exist".format(self.name))
 
-        pgp_keys = [line.split("=")[1].strip() for line in makepkg("--printsrcinfo", True, package_dir) if
-                    "validpgpkeys =" in line]
+        pgp_keys = Package.getPGPKeys(os.path.join(package_dir, "PKGBUILD"))
 
         for pgp_key in pgp_keys:
-            is_key_known = run("gpg --list-public-keys {}".format(pgp_key), shell=True, stdout=DEVNULL,
-                               stderr=DEVNULL).returncode == 0
-            if not is_key_known:
+            if run(["gpg", "--list-public-keys", pgp_key], stdout=DEVNULL, stderr=DEVNULL).returncode != 0:
                 if fetch_always or ask_user(
                         "PGP Key {} found in PKGBUILD of {} and is not known yet. "
                         "Do you want to import the key?".format(Colors.BOLD(Colors.LIGHT_MAGENTA(pgp_key)),
                                                                 Colors.BOLD(Colors.LIGHT_MAGENTA(self.name))), True):
                     if keyserver is None:
-                        if run("gpg --recv-keys {}".format(pgp_key), shell=True).returncode != 0:
-                            logging.error("Import PGP key {} failed.".format(pgp_key))
-                            raise ConnectionProblem("Import PGP key {} failed.".format(pgp_key))
+                        if run(["gpg", "--recv-keys", pgp_key]).returncode != 0:
+                            logging.error(
+                                "Import PGP key {} failed. "
+                                "This is an error in your GnuPG installation.".format(pgp_key)
+                            )
+                            raise ConnectionProblem(
+                                "Import PGP key {} failed. "
+                                "This is an error in your GnuPG installation.".format(pgp_key)
+                            )
                     else:
-                        if run("gpg --keyserver {} --recv-keys {}".format(keyserver, pgp_key),
-                               shell=True).returncode != 0:
-                            logging.error("Import PGP key {} from {} failed.".format(pgp_key, keyserver))
-                            raise ConnectionProblem("Import PGP key {} from {} failed.".format(pgp_key, keyserver))
+                        if run(
+                                ["gpg", "--keyserver", keyserver, "--recv-keys", pgp_key]
+                        ).returncode != 0:
+                            logging.error(
+                                "Import PGP key {} from {} failed. "
+                                "This is an error in your GnuPG installation.".format(pgp_key, keyserver)
+                            )
+                            raise ConnectionProblem(
+                                "Import PGP key {} from {} failed. "
+                                "This is an error in your GnuPG installation.".format(pgp_key, keyserver)
+                            )
 
     def show_pkgbuild(self, noedit: bool = False, show_changes: bool = False,
-                      fetch_always: bool = False, keyserver: str = None, always_edit: bool = False):
+                      fetch_always: bool = False, keyserver: str = None, always_edit: bool = False,
+                      default_show_changes: bool = False):
         """
         Lets the user review and edit unreviewed PKGBUILD and install files of this package
 
@@ -896,6 +1000,8 @@ class Package:
         :param fetch_always:    True if the keys should be fetched without asking the user, False otherwise
         :param keyserver:       keyserver to fetch the pgp keys from
         :param always_edit:     True if the user wants to edit package files, even if there are no new changes
+        :param default_show_changes:    True if the default for the question "Do you want to see the changes of ..."
+                                        should be Yes, False for default No
         """
 
         package_dir = os.path.join(Package.cache_dir, self.pkgbase)
@@ -908,26 +1014,23 @@ class Package:
             raise InvalidInput("Package dir of {} does not exist".format(self.name))
 
         # if aurman dir does not exist - create
-        if not os.path.isdir(git_aurman_dir):
-            if run("install -dm700 '{}'".format(git_aurman_dir), shell=True, stdout=DEVNULL,
-                   stderr=DEVNULL).returncode != 0:
-                logging.error("Creating git_aurman_dir of {} failed".format(self.name))
-                raise InvalidInput("Creating git_aurman_dir of {} failed".format(self.name))
+        try:
+            os.makedirs(git_aurman_dir, mode=0o700, exist_ok=True)
+        except OSError:
+            logging.error("Creating git_aurman_dir {} failed".format(git_aurman_dir))
+            raise InvalidInput("Creating git_aurman_dir {} failed".format(git_aurman_dir))
 
         # if last commit seen hash file does not exist - create
         if not os.path.isfile(last_commit_hash_file):
-            empty_tree_hash = run("git hash-object -t tree --stdin < /dev/null", shell=True,
-                                  stdout=PIPE, stderr=DEVNULL, universal_newlines=True).stdout.strip()
+            with open(last_commit_hash_file, 'w') as f:
+                run(["git", "hash-object", "-t", "tree", "/dev/null"], stdout=f, stderr=DEVNULL)
 
-            with open(last_commit_hash_file, "w") as f:
-                f.write(empty_tree_hash)
-
-        current_commit_hash = run("git rev-parse HEAD",
-                                  shell=True, stdout=PIPE, stderr=DEVNULL,
-                                  cwd=package_dir, universal_newlines=True).stdout.strip()
+        current_commit_hash = run(
+            ["git", "rev-parse", "HEAD"], stdout=PIPE, stderr=DEVNULL, cwd=package_dir, universal_newlines=True
+        ).stdout.strip()
 
         # if files have been reviewed
-        with open(last_commit_hash_file, "r") as f:
+        with open(last_commit_hash_file, 'r') as f:
             last_seen_hash = f.read().strip()
 
         # do not return if always_edit is true
@@ -936,8 +1039,9 @@ class Package:
 
         # relevant files are all files besides .SRCINFO
         relevant_files = []
-        files_in_pack_dir = run("git ls-files", shell=True, stdout=PIPE, stderr=DEVNULL,
-                                universal_newlines=True, cwd=package_dir).stdout.strip().splitlines()
+        files_in_pack_dir = run(
+            ["git", "ls-files"], stdout=PIPE, stderr=DEVNULL, universal_newlines=True, cwd=package_dir
+        ).stdout.strip().splitlines()
         for file in files_in_pack_dir:
             if file != ".SRCINFO":
                 relevant_files.append(file)
@@ -948,10 +1052,13 @@ class Package:
         # check if there are changes, if there are, ask the user if he wants to see them
         if not noedit:
             if show_changes or always_edit or ask_user("Do you want to see the changes of {}?"
-                                                       "".format(Colors.BOLD(Colors.LIGHT_MAGENTA(self.name))), False):
+                                                       "".format(Colors.BOLD(Colors.LIGHT_MAGENTA(self.name))),
+                                                       default_show_changes):
 
-                run("git diff {} {} -- . ':(exclude).SRCINFO'"
-                    "".format(last_seen_hash, current_commit_hash), shell=True, cwd=package_dir)
+                run(
+                    ["git", "diff", last_seen_hash, current_commit_hash, "--", ".", ":(exclude).SRCINFO"],
+                    cwd=package_dir
+                )
                 any_changes_seen = True
 
                 while True:
@@ -961,9 +1068,12 @@ class Package:
                                           Colors.BOLD(Colors.LIGHT_GREEN("just press enter"))), True)
 
                     for i in range(0, len(relevant_files)):
-                        print("{}: {}"
-                              "".format(Colors.BOLD(Colors.LIGHT_GREEN(i + 1)),
-                                        Colors.BOLD(Colors.LIGHT_MAGENTA(relevant_files[i]))))
+                        print(
+                            "{}: {}".format(
+                                Colors.BOLD(Colors.LIGHT_GREEN(i + 1)),
+                                Colors.BOLD(Colors.LIGHT_MAGENTA(relevant_files[i]))
+                            )
+                        )
 
                     try:
                         user_input = input(aurman_question("Enter the number: ", False, False)).strip()
@@ -978,9 +1088,9 @@ class Package:
 
                     else:
                         file = relevant_files[user_input - 1]
-                        if run("{} {}"
-                               "".format(Package.default_editor_path,
-                                         os.path.join(package_dir, file)), shell=True).returncode != 0:
+                        if run(
+                                Package.default_editor_path.split() + [os.path.join(package_dir, file)]
+                        ).returncode != 0:
                             logging.error("Editing {} of {} failed".format(file, self.name))
                             raise InvalidInput("Editing {} of {} failed".format(file, self.name))
 
@@ -993,7 +1103,7 @@ class Package:
             # fetch pgp keys
             self.search_and_fetch_pgp_keys(fetch_always, keyserver)
 
-            with open(last_commit_hash_file, "w") as f:
+            with open(last_commit_hash_file, 'w') as f:
                 f.write(current_commit_hash)
 
         else:
@@ -1015,64 +1125,79 @@ class Package:
             logging.error("package dir of {} does not exist".format(self.name))
             raise InvalidInput("package dir of {} does not exist".format(self.name))
 
-        src_lines = makepkg("--printsrcinfo", True, package_dir)
+        src_lines = makepkg(["--printsrcinfo"], True, package_dir)
         pkgver = None
         pkgrel = None
         epoch = None
-        for line in src_lines:
-            if "pkgver =" in line:
-                pkgver = line.split("=")[1].strip()
-            elif "pkgrel =" in line:
-                pkgrel = line.split("=")[1].strip()
-            elif "epoch =" in line:
-                epoch = line.split("=")[1].strip()
+        try:
+            for line in src_lines:
+                if "pkgver =" in line:
+                    pkgver = line.split("=")[1].strip()
+                elif "pkgrel =" in line:
+                    pkgrel = line.split("=")[1].strip()
+                elif "epoch =" in line:
+                    epoch = int(line.split("=")[1].strip())
+        except ValueError:
+            logging.error(
+                ".SRCINFO of {} is malformed. It includes non integer values for the epoch.".format(self.name)
+            )
+            raise InvalidInput(
+                ".SRCINFO of {} is malformed. It includes non integer values for the epoch.".format(self.name)
+            )
 
         version = ""
-        if epoch is not None:
-            version += epoch + ":"
+        if epoch is not None and epoch > 0:
+            version += str(epoch) + ":"
         if pkgver is not None:
             version += pkgver
         else:
             logging.info("version of {} must be there".format(self.name))
             raise InvalidInput("version of {} must be there".format(self.name))
         if pkgrel is not None:
+            try:
+                float(pkgrel)
+            except ValueError:
+                logging.error(
+                    ".SRCINFO of {} is malformed. It includes non float values for the pkgrel.".format(self.name)
+                )
+                raise InvalidInput(
+                    ".SRCINFO of {} is malformed. It includes non float values for the pkgrel.".format(self.name)
+                )
+
             version += "-" + pkgrel
 
         return version
 
-    def get_devel_version(self):
+    def get_devel_version(self, ignore_arch: bool = False, ignore_deps: bool = False):
         """
         Fetches the current sources of this package.
         devel packages only!
+
+        :param ignore_arch: If True, pass -A to makepkg, thus allows building packages for architectures,
+                            not mentioned in the PKGBUILD
+        :param ignore_deps: If True, pass -d to makepkg, thus allows ignoring unfulfilled dependencies
         """
 
         package_dir = os.path.join(Package.cache_dir, self.pkgbase)
-        makepkg("-odc --noprepare --skipinteg", False, package_dir)
+        to_execute = ["-o", "-c"]
+        if ignore_arch:
+            to_execute += ["-A"]
+        if ignore_deps:
+            to_execute += ["-d"]
+
+        makepkg(to_execute, False, package_dir)
 
         self.version = self.version_from_srcinfo()
 
     @staticmethod
     def get_build_dir(package_dir):
         """
-        Gets the build directoy, if it is different from the package dir
+        Gets the build directory, if it is different from the package dir
 
         :param package_dir:     The package dir of the package
         :return:                The build dir in case there is one, the package dir otherwise
         """
-        makepkg_conf = os.path.join("/etc", "makepkg.conf")
-        if not os.path.isfile(makepkg_conf):
-            logging.error("makepkg.conf not found")
-            raise InvalidInput("makepkg.conf not found")
-
-        with open(makepkg_conf, "r") as f:
-            makepkg_conf_lines = f.read().strip().splitlines()
-
-        for line in makepkg_conf_lines:
-            line_stripped = line.strip()
-            if line_stripped.startswith("PKGDEST="):
-                return os.path.expandvars(os.path.expanduser(line_stripped.split("PKGDEST=")[1].strip()))
-        else:
-            return package_dir
+        return os.path.split(makepkg(["--packagelist"], True, package_dir)[0])[0]
 
     def get_package_file_to_install(self, build_dir: str, build_version: str) -> Union[str, None]:
         """
@@ -1082,34 +1207,46 @@ class Package:
         :param build_version:   Build version to look for
         :return:                The name of the package file to install, None if there is none
         """
+        package_dir = os.path.join(Package.cache_dir, self.pkgbase)
+
         files_in_build_dir = [f for f in os.listdir(build_dir) if os.path.isfile(os.path.join(build_dir, f))]
+        files_to_build = [os.path.split(build_line)[1] for build_line in makepkg(["--packagelist"], True, package_dir)]
         for file in files_in_build_dir:
-            if file.startswith(self.name + "-" + build_version + "-") and ".pkg." in \
-                    file.split(self.name + "-" + build_version + "-")[1]:
+            if file.startswith(self.name + "-" + build_version + "-") and file in files_to_build:
                 return file
         else:
             return None
 
-    def build(self):
+    def build(self, ignore_arch: bool = False, rebuild: bool = False):
         """
         Build this package
 
+        :param ignore_arch: If True, pass -A to makepkg, thus allows building packages for architectures,
+                            not mentioned in the PKGBUILD
+        :param rebuild:     If True, always rebuild package
         """
         # check if build needed
         build_version = self.version_from_srcinfo()
         package_dir = os.path.join(Package.cache_dir, self.pkgbase)
         build_dir = Package.get_build_dir(package_dir)
 
-        if self.get_package_file_to_install(build_dir, build_version) is None:
-            makepkg("-cf --noconfirm", False, package_dir)
+        if rebuild or (self.get_package_file_to_install(build_dir, build_version) is None):
+            if not ignore_arch:
+                makepkg(["-cf", "--noconfirm"], False, package_dir)
+            else:
+                makepkg(["-cfA", "--noconfirm"], False, package_dir)
 
-    def install(self, args_as_string: str):
+    def install(self, args_as_list: List[str], use_ask: bool = False, do_not_execute: bool = False) -> Tuple[str, str]:
         """
         Install this package
 
-        :param args_as_string: Args for pacman
+        :param args_as_list:    Args for pacman
+        :param use_ask:         Use --ask=4 when calling pacman, see: https://git.archlinux.org/pacman.git/commit/?id=90e3e026d1236ad89c142b427d7eeb842bbb7ff4
+        :param do_not_execute:  If only to return the relevant parameters, without executing
+        :return:                Tuple containing two items: build_dir, package_install_file
         """
         build_dir = Package.get_build_dir(os.path.join(Package.cache_dir, self.pkgbase))
+        args_as_list = args_as_list[:]
 
         # get name of package install file
         build_version = self.version_from_srcinfo()
@@ -1119,8 +1256,14 @@ class Package:
             logging.error("package file of {} not available".format(self.name))
             raise InvalidInput("package file of {} not available".format(self.name))
 
+        if use_ask:
+            args_as_list = ["--ask=4"] + args_as_list
+
         # install
-        pacman("{} {}".format(args_as_string, package_install_file), False, dir_to_execute=build_dir)
+        if not do_not_execute:
+            pacman(args_as_list + [package_install_file], False, dir_to_execute=build_dir)
+
+        return build_dir, package_install_file
 
 
 class System:
@@ -1135,13 +1278,13 @@ class System:
 
         :return:    A list containing the installed packages
         """
-        repo_packages_names = set(expac("-S", ('n',), ()))
+        repo_packages_names = set(expac("-S", ['n'], []))
 
         # packages the user wants to install from aur
         aur_names = packages_from_other_sources()[0]
         repo_packages_names -= aur_names
 
-        installed_packages_names = set(expac("-Q", ('n',), ()))
+        installed_packages_names = set(expac("-Q", ['n'], []))
         installed_repo_packages_names = installed_packages_names & repo_packages_names
         unclassified_installed_names = installed_packages_names - installed_repo_packages_names
 
@@ -1150,11 +1293,13 @@ class System:
         # installed repo packages
         if installed_repo_packages_names:
             return_list.extend(
-                Package.get_packages_from_expac("-Q", list(installed_repo_packages_names), PossibleTypes.REPO_PACKAGE))
+                Package.get_packages_from_expac("-Q", list(installed_repo_packages_names), PossibleTypes.REPO_PACKAGE)
+            )
 
         # installed aur packages
         installed_aur_packages_names = set(
-            [package.name for package in Package.get_packages_from_aur(list(unclassified_installed_names))])
+            [package.name for package in Package.get_packages_from_aur(list(unclassified_installed_names))]
+        )
 
         # package names the user gave us must be in the aur
         for name in aur_names:
@@ -1164,14 +1309,19 @@ class System:
 
         if installed_aur_packages_names:
             return_list.extend(
-                Package.get_packages_from_expac("-Q", list(installed_aur_packages_names), PossibleTypes.AUR_PACKAGE))
+                Package.get_packages_from_expac("-Q", list(installed_aur_packages_names), PossibleTypes.AUR_PACKAGE)
+            )
 
         unclassified_installed_names -= installed_aur_packages_names
 
         # installed not repo not aur packages
         if unclassified_installed_names:
-            return_list.extend(Package.get_packages_from_expac("-Q", list(unclassified_installed_names),
-                                                               PossibleTypes.PACKAGE_NOT_REPO_NOT_AUR))
+            return_list.extend(
+                Package.get_packages_from_expac(
+                    "-Q", list(unclassified_installed_names),
+                    PossibleTypes.PACKAGE_NOT_REPO_NOT_AUR
+                )
+            )
 
         return return_list
 
@@ -1182,7 +1332,7 @@ class System:
 
         :return:    A list containing the current repo packages
         """
-        return Package.get_packages_from_expac("-S", (), PossibleTypes.REPO_PACKAGE)
+        return Package.get_packages_from_expac("-S", [], PossibleTypes.REPO_PACKAGE)
 
     def __init__(self, packages: Sequence['Package']):
         self.all_packages_dict = {}  # names as keys and packages as values
@@ -1253,9 +1403,12 @@ class System:
 
         if dep_name in self.all_packages_dict:
             package = self.all_packages_dict[dep_name]
-            if dep_cmp == "":
+            if not dep_cmp:
                 return_list.append(package)
             elif version_comparison(package.version, dep_cmp, dep_version):
+                return_list.append(package)
+            # https://github.com/polygamma/aurman/issues/246
+            elif Package.ignore_versioning:
                 return_list.append(package)
 
         if dep_name in self.provides_dict:
@@ -1271,12 +1424,15 @@ class System:
                     if provide_name != dep_name:
                         continue
 
-                    if dep_cmp == "":
+                    if not dep_cmp:
                         return_list.append(package)
-                    elif (provide_cmp == "=" or provide_cmp == "==") and version_comparison(provide_version, dep_cmp,
-                                                                                            dep_version):
+                    elif provide_cmp == "=" and version_comparison(provide_version, dep_cmp, dep_version):
                         return_list.append(package)
-                    elif (provide_cmp == "") and version_comparison(package.version, dep_cmp, dep_version):
+                    # https://github.com/polygamma/aurman/issues/67
+                    elif not provide_cmp and Package.optimistic_versioning:
+                        return_list.append(package)
+                    # https://github.com/polygamma/aurman/issues/246
+                    elif Package.ignore_versioning:
                         return_list.append(package)
 
         return return_list
@@ -1288,47 +1444,50 @@ class System:
         :param package:     The package to check for conflicts with
         :return:            List containing the conflicting packages
         """
-        name = package.name
-        version = package.version
 
         return_list = []
 
-        if name in self.all_packages_dict:
-            return_list.append(self.all_packages_dict[name])
+        # ignoring versioning has to be deactivated while checking for conflicts
+        ignore_versioning_copy = Package.ignore_versioning
+        Package.ignore_versioning = False
+
+        if package.name in self.all_packages_dict:
+            return_list.append(self.all_packages_dict[package.name])
 
         for conflict in package.conflicts:
-            conflict_name, conflict_cmp, conflict_version = split_name_with_versioning(conflict)
+            for conflicting_package in self.provided_by(conflict):
+                if conflicting_package not in return_list:
+                    return_list.append(conflicting_package)
 
-            if conflict_name not in self.all_packages_dict:
-                continue
+        provides = list(package.provides)
+        for providing in provides[:]:
+            prov_name, prov_cmp, prov_version = split_name_with_versioning(providing)
+            if prov_name == package.name:
+                provides.remove(providing)
+        provides.append("{}={}".format(package.name, package.version))
 
-            possible_conflict_package = self.all_packages_dict[conflict_name]
+        for providing in provides:
+            prov_name, prov_cmp, prov_version = split_name_with_versioning(providing)
+            if prov_name in self.conflicts_dict:
+                possible_conflict_packages = self.conflicts_dict[prov_name]
+                for possible_conflict_package in possible_conflict_packages:
 
-            if possible_conflict_package in return_list:
-                continue
-
-            if conflict_cmp == "":
-                return_list.append(possible_conflict_package)
-            elif version_comparison(possible_conflict_package.version, conflict_cmp, conflict_version):
-                return_list.append(possible_conflict_package)
-
-        if name in self.conflicts_dict:
-            possible_conflict_packages = self.conflicts_dict[name]
-            for possible_conflict_package in possible_conflict_packages:
-
-                if possible_conflict_package in return_list:
-                    continue
-
-                for conflict in possible_conflict_package.conflicts:
-                    conflict_name, conflict_cmp, conflict_version = split_name_with_versioning(conflict)
-
-                    if conflict_name != name:
+                    if possible_conflict_package in return_list:
                         continue
 
-                    if conflict_cmp == "":
-                        return_list.append(possible_conflict_package)
-                    elif version_comparison(version, conflict_cmp, conflict_version):
-                        return_list.append(possible_conflict_package)
+                    for conflict in possible_conflict_package.conflicts:
+                        conflict_name, conflict_cmp, conflict_version = split_name_with_versioning(conflict)
+
+                        if conflict_name != prov_name:
+                            continue
+
+                        if not conflict_cmp:
+                            return_list.append(possible_conflict_package)
+                        elif prov_cmp == "=" and version_comparison(prov_version, conflict_cmp, conflict_version):
+                            return_list.append(possible_conflict_package)
+
+        # reset ignoring of versioning
+        Package.ignore_versioning = ignore_versioning_copy
 
         return return_list
 
@@ -1388,9 +1547,11 @@ class System:
             if not self.provided_by(dep):
                 if print_reason:
                     aurman_note(
-                        "Dependency {} of package {} is not fulfilled".format(Colors.BOLD(Colors.LIGHT_MAGENTA(dep)),
-                                                                              Colors.BOLD(
-                                                                                  Colors.LIGHT_MAGENTA(package.name))))
+                        "Dependency {} of package {} is not fulfilled".format(
+                            Colors.BOLD(Colors.LIGHT_MAGENTA(dep)),
+                            Colors.BOLD(Colors.LIGHT_MAGENTA(package.name))
+                        )
+                    )
                 return False
         else:
             return True
@@ -1399,7 +1560,7 @@ class System:
     def calc_install_chunks(packages_to_chunk: Sequence['Package']) -> List[List['Package']]:
         """
         Calculates the chunks in which the given packages would be installed.
-        Repo packages are installed at once, AUR packages one by one.
+        Repo packages are installed at once, AUR packages in chunks if they are split packages.
         e.g. AUR1, Repo1, Repo2, AUR2 yields: AUR1, Repo1 AND Repo2, AUR2
 
         :param packages_to_chunk:   The packages to calc the chunks of
@@ -1409,8 +1570,9 @@ class System:
         return_list: List[List['Package']] = [current_list]
 
         for package in packages_to_chunk:
-            if current_list and (package.type_of is not PossibleTypes.REPO_PACKAGE
-                                 or current_list[0].type_of is not package.type_of):
+            if current_list and (current_list[0].type_of is not package.type_of
+                                 or package.type_of is not PossibleTypes.REPO_PACKAGE
+                                 and package.pkgbase != current_list[0].pkgbase):
 
                 current_list = [package]
                 return_list.append(current_list)
@@ -1445,14 +1607,17 @@ class System:
                 if dep_name in dep_providers_names:
                     sanitized_names.add(dep_name)
                 else:
-                    aurman_note("We found multiple providers for {}"
-                                "\nChoose one by entering the corresponding number."
-                                "".format(Colors.BOLD(Colors.LIGHT_MAGENTA(name))))
+                    aurman_note(
+                        "We found multiple providers for {}\nChoose one by entering the corresponding number.".format(
+                            Colors.BOLD(Colors.LIGHT_MAGENTA(name))
+                        )
+                    )
 
                     while True:
                         for i in range(0, len(providers_for_name)):
                             print(
-                                "Number {}: {}".format(i + 1, self.repo_of_package(providers_for_name[i].name)))
+                                "Number {}: {}".format(i + 1, self.repo_of_package(providers_for_name[i].name))
+                            )
 
                         try:
                             user_input = int(input(aurman_question("Enter the number: ", False, False)))
@@ -1468,7 +1633,7 @@ class System:
 
     def hypothetical_append_packages_to_system(self, packages: List['Package'],
                                                packages_names_print_reason: Iterable[str] = None,
-                                               print_way: bool = False) -> 'System':
+                                               print_way: bool = False, check_if_possible: bool = False) -> 'System':
         """
         hypothetically appends packages to this system (only makes sense for the installed system)
         and removes all conflicting packages and packages whose deps are not fulfilled anymore.
@@ -1477,12 +1642,16 @@ class System:
         :param packages_names_print_reason: print the uninstall reasons for packages
                                             with names in this iterable
         :param print_way:                   Prints the way of appending packages
+        :param check_if_possible:           checks if the appending to the system is actually possible
+                                            informs to rerun with --solution_way in case it is not
         :return:                            the new system
         """
 
         new_system = System(list(self.all_packages_dict.values()))
         if not packages:
             return new_system
+
+        informed_about_not_possible: bool = False
 
         chunked_packages = System.calc_install_chunks(packages)
         last_index = len(chunked_packages) - 1
@@ -1507,7 +1676,9 @@ class System:
                                 aurman_note(
                                     "Package {} will be removed due to a conflict with {}".format(
                                         Colors.BOLD(Colors.LIGHT_MAGENTA(package_to_be_removed.name)),
-                                        Colors.BOLD(Colors.LIGHT_MAGENTA(package.name))))
+                                        Colors.BOLD(Colors.LIGHT_MAGENTA(package.name))
+                                    )
+                                )
 
                     # save the found packages for later deletion
                     conflicting_new_system_packages.extend(new_system.conflicting_with(package))
@@ -1527,39 +1698,69 @@ class System:
                             to_delete_packages_names.add(package.name)
                         else:
                             old_package = new_system.all_packages_dict[package.name]
-                            new_package = [chunk_pack for chunk_pack in
-                                           package_chunk if package.name == chunk_pack.name][0]
+                            new_package = [
+                                chunk_pack for chunk_pack in package_chunk if package.name == chunk_pack.name
+                            ][0]
                             if old_package.version == new_package.version:
                                 to_reinstall_packages_names.add(package.name)
                             else:
                                 to_upgrade_packages_names.add(package.name)
 
                     if to_upgrade_packages_names:
-                        print("   {}   : {}"
-                              "".format(Colors.BOLD(Colors.LIGHT_CYAN("Upgrade"))
-                                        , ", ".join([Colors.BOLD(Colors.LIGHT_MAGENTA(name))
-                                                     for name in sorted(to_upgrade_packages_names)])))
+                        print(
+                            "   {}   : {}".format(
+                                Colors.BOLD(Colors.LIGHT_CYAN("Upgrade")),
+                                ", ".join(
+                                    [
+                                        Colors.BOLD(Colors.LIGHT_MAGENTA(name))
+                                        for name in sorted(to_upgrade_packages_names)
+                                    ]
+                                )
+                            )
+                        )
 
                     if to_reinstall_packages_names:
-                        print("   {} : {}"
-                              "".format(Colors.BOLD(Colors.LIGHT_MAGENTA("Reinstall"))
-                                        , ", ".join([Colors.BOLD(Colors.LIGHT_MAGENTA(name))
-                                                     for name in sorted(to_reinstall_packages_names)])))
+                        print(
+                            "   {} : {}".format(
+                                Colors.BOLD(Colors.LIGHT_MAGENTA("Reinstall")),
+                                ", ".join(
+                                    [
+                                        Colors.BOLD(Colors.LIGHT_MAGENTA(name))
+                                        for name in sorted(to_reinstall_packages_names)
+                                    ]
+                                )
+                            )
+                        )
 
                     if to_delete_packages_names:
-                        print("   {}    : {}"
-                              "".format(Colors.BOLD(Colors.LIGHT_RED("Remove"))
-                                        , ", ".join([Colors.BOLD(Colors.LIGHT_MAGENTA(name))
-                                                     for name in sorted(to_delete_packages_names)])))
+                        print(
+                            "   {}    : {}".format(
+                                Colors.BOLD(Colors.LIGHT_RED("Remove")),
+                                ", ".join(
+                                    [
+                                        Colors.BOLD(Colors.LIGHT_MAGENTA(name))
+                                        for name in sorted(to_delete_packages_names)
+                                    ]
+                                )
+                            )
+                        )
 
                     to_install_packages_names = packages_chunk_names - set.union(
-                        *[to_upgrade_packages_names, to_reinstall_packages_names])
+                        *[to_upgrade_packages_names, to_reinstall_packages_names]
+                    )
 
                     if to_install_packages_names:
-                        print("   {}   : {}"
-                              "".format(Colors.BOLD(Colors.LIGHT_GREEN("Install"))
-                                        , ", ".join([Colors.BOLD(Colors.LIGHT_MAGENTA(name))
-                                                     for name in sorted(to_install_packages_names)])))
+                        print(
+                            "   {}   : {}".format(
+                                Colors.BOLD(Colors.LIGHT_GREEN("Install")),
+                                ", ".join(
+                                    [
+                                        Colors.BOLD(Colors.LIGHT_MAGENTA(name))
+                                        for name in sorted(to_install_packages_names)
+                                    ]
+                                )
+                            )
+                        )
 
                 # remove conflicting packages
                 if conflicting_new_system_packages:
@@ -1594,14 +1795,34 @@ class System:
                     if not to_delete_packages:
                         break
 
+                    if not informed_about_not_possible and not print_way and check_if_possible:
+                        aurman_error(
+                            "It is not possible to install the found solution without manual user intervention.\n"
+                            "   Please rerun aurman with {} to see the reason".format(
+                                Colors.BOLD(Colors.LIGHT_MAGENTA("--solution_way"))
+                            ),
+                            new_line=True
+                        )
+                        informed_about_not_possible = True
+
                     # print what will be done
                     if print_way:
                         packages_names_to_del = set([package.name for package in to_delete_packages])
 
-                        print("   {}    : {}"
-                              "".format(Colors.BOLD(Colors.LIGHT_RED("Remove"))
-                                        , ", ".join([Colors.BOLD(Colors.LIGHT_MAGENTA(name))
-                                                     for name in sorted(packages_names_to_del)])))
+                        print(
+                            "   {}    : {} - {}".format(
+                                Colors.BOLD(Colors.LIGHT_RED("Remove")),
+                                ", ".join(
+                                    [
+                                        Colors.BOLD(Colors.LIGHT_MAGENTA(name))
+                                        for name in sorted(packages_names_to_del)
+                                    ]
+                                ),
+                                Colors.BOLD(
+                                    "because of dependency breakage, needs manual intervention"
+                                )
+                            )
+                        )
 
                     # actually delete the packages
                     for package in to_delete_packages:
@@ -1683,8 +1904,10 @@ class System:
                 else:
                     current_difference_tuple[1].add(differ)
 
-        first_return_tuple = (set.intersection(*[difference_tuple[0] for difference_tuple in differences_tuples]),
-                              set.intersection(*[difference_tuple[1] for difference_tuple in differences_tuples]))
+        first_return_tuple = (
+            set.intersection(*[difference_tuple[0] for difference_tuple in differences_tuples]),
+            set.intersection(*[difference_tuple[1] for difference_tuple in differences_tuples])
+        )
 
         return_list = []
 
@@ -1747,20 +1970,27 @@ class System:
         return return_list
 
     def validate_and_choose_solution(self, solutions: List[List['Package']],
-                                     needed_packages: Sequence['Package']) -> List['Package']:
+                                     needed_packages: Sequence['Package'], upstream_system: 'System',
+                                     deep_search: bool, solution_way: bool) -> List['Package']:
         """
         Validates solutions and lets the user choose a solution
 
         :param solutions:           The solutions
         :param needed_packages:     Packages which need to be in the solutions
+        :param upstream_system:     The system containing the upstream packages
+        :param deep_search:         If --deep_search
+        :param solution_way:        If --solution_way
         :return:                    A chosen and valid solution
         """
 
         # needed strings
-        different_solutions_found = aurman_status("We found {} different valid solutions.\n"
-                                                  "You will be shown the differences between the solutions.\n"
-                                                  "Choose one of them by entering the corresponding number.\n",
-                                                  True, False)
+        different_solutions_found = aurman_status(
+            "We found {} different valid solutions.\n"
+            "You will be shown the differences between the solutions.\n"
+            "Choose one of them by entering the corresponding number.\n",
+            True,
+            False
+        )
         solution_print = aurman_note("Number {}:\nGetting installed: {}\nGetting removed: {}\n", True, False)
         choice_not_valid = aurman_error("That was not a valid choice!", False, False)
 
@@ -1774,7 +2004,8 @@ class System:
             return valid_systems_tuples[0][1]
 
         systems_differences = self.differences_between_systems(
-            [valid_systems_tuple[0] for valid_systems_tuple in valid_systems_tuples])
+            [valid_systems_tuple[0] for valid_systems_tuple in valid_systems_tuples]
+        )
 
         # print for the user
         print(different_solutions_found.format(len(valid_systems_tuples)))
@@ -1787,19 +2018,34 @@ class System:
                 installed_names.sort()
                 removed_names.sort()
 
-                print(solution_print.format(i + 1,
-                                            ", ".join(
-                                                [Colors.BOLD(Colors.LIGHT_GREEN(name)) for name in installed_names]),
-                                            ", ".join([Colors.BOLD(Colors.RED(name)) for name in removed_names])))
+                print(
+                    solution_print.format(
+                        i + 1,
+                        ", ".join([Colors.BOLD(Colors.LIGHT_GREEN(name)) for name in installed_names]),
+                        ", ".join([Colors.BOLD(Colors.RED(name)) for name in removed_names])
+                    )
+                )
 
             try:
-                user_input = int(input(aurman_question("Enter the number: ", False, False)))
+                user_input = int(input(
+                    aurman_question("Enter the number (or 0 to see every solution in detail): ", False, False)
+                ))
                 if 1 <= user_input <= len(valid_systems_tuples):
                     return valid_systems_tuples[user_input - 1][1]
+                # show solution details
+                elif user_input == 0:
+                    for index in range(0, len(valid_systems_tuples)):
+                        aurman_status(Colors.BOLD("Number {}".format(index + 1)) + ":", True, True)
+                        self.show_solution_differences_to_user(
+                            valid_systems_tuples[index][1], upstream_system, True, deep_search, solution_way
+                        )
+                    aurman_status("All solutions have been shown", True, True)
+
             except ValueError:
                 print(choice_not_valid)
             else:
-                print(choice_not_valid)
+                if user_input != 0:
+                    print(choice_not_valid)
 
     def repo_of_package(self, package_name: str) -> str:
         """
@@ -1831,19 +2077,26 @@ class System:
         """
 
         # needed strings
-        package_to_install = aurman_note("The following {} package(s) "
-                                         "are getting "
-                                         "{}:".format("{}", Colors.BOLD(Colors.LIGHT_CYAN("installed"))), True, False)
-        packages_to_uninstall = aurman_note("The following {} package(s) "
-                                            "are getting "
-                                            "{}:".format("{}", Colors.BOLD(Colors.LIGHT_CYAN("removed"))), True, False)
-        packages_to_upgrade = aurman_note("The following {} package(s) "
-                                          "are getting "
-                                          "{}:".format("{}", Colors.BOLD(Colors.LIGHT_CYAN("updated"))), True, False)
-        packages_to_reinstall = aurman_note("The following {} package(s) "
-                                            "are getting "
-                                            "{}:".format("{}", Colors.BOLD(Colors.LIGHT_CYAN("reinstalled"))), True,
-                                            False)
+        package_to_install = aurman_note(
+            "The following {} package(s) are getting {}:".format(
+                "{}", Colors.BOLD(Colors.LIGHT_CYAN("installed"))
+            ), True, False
+        )
+        packages_to_uninstall = aurman_note(
+            "The following {} package(s) are predicted to get {}:".format(
+                "{}", Colors.BOLD(Colors.LIGHT_CYAN("removed"))
+            ), True, False
+        )
+        packages_to_upgrade = aurman_note(
+            "The following {} package(s) are getting {}:".format(
+                "{}", Colors.BOLD(Colors.LIGHT_CYAN("updated"))
+            ), True, False
+        )
+        packages_to_reinstall = aurman_note(
+            "The following {} package(s) are getting {}:".format(
+                "{}", Colors.BOLD(Colors.LIGHT_CYAN("reinstalled"))
+            ), True, False
+        )
         user_question = "Do you want to continue?"
 
         new_system = self.hypothetical_append_packages_to_system(solution)
@@ -1855,8 +2108,10 @@ class System:
         to_install_names -= to_upgrade_names
         to_uninstall_names -= to_upgrade_names
         just_reinstall_names = set(
-            [package.name for package in solution if package.name in new_system.all_packages_dict]) - set.union(
-            *[to_upgrade_names, to_install_names, to_uninstall_names])
+            [package.name for package in solution if package.name in new_system.all_packages_dict]
+        ) - set.union(
+            *[to_upgrade_names, to_install_names, to_uninstall_names]
+        )
 
         # colored names + repos
         print_to_install_names = set([upstream_system.repo_of_package(name) for name in to_install_names])
@@ -1865,13 +2120,24 @@ class System:
         print_just_reinstall_names = set([upstream_system.repo_of_package(name) for name in just_reinstall_names])
 
         # calculate some needed values
-        max_package_name_length = max([len(name) for name in set(
-            print_to_install_names | print_to_uninstall_names | print_to_upgrade_names | print_just_reinstall_names)],
-                                      default=0)
+        max_package_name_length = max(
+            [
+                len(name) for name in
+                set(print_to_install_names |
+                    print_to_uninstall_names |
+                    print_to_upgrade_names |
+                    print_just_reinstall_names)
+            ],
+            default=0
+        )
 
-        max_left_side_version_length = max([len(self.all_packages_dict[package_name].version) for package_name in
-                                            set(to_uninstall_names | to_upgrade_names | just_reinstall_names)],
-                                           default=1)
+        max_left_side_version_length = max(
+            [
+                len(self.all_packages_dict[package_name].version) for package_name in
+                set(to_uninstall_names | to_upgrade_names | just_reinstall_names)
+            ],
+            default=1
+        )
 
         if to_install_names:
             print(package_to_install.format(len(to_install_names)))
@@ -1879,7 +2145,8 @@ class System:
                 string_to_print = "   {}  {}  ->  {}".format(
                     upstream_system.repo_of_package(package_name).ljust(max_package_name_length),
                     Colors.RED("/").ljust(max_left_side_version_length + 10),
-                    Colors.GREEN(new_system.all_packages_dict[package_name].version))
+                    Colors.GREEN(new_system.all_packages_dict[package_name].version)
+                )
 
                 print(string_to_print)
 
@@ -1889,7 +2156,8 @@ class System:
                 string_to_print = "   {}  {}  ->  {}".format(
                     upstream_system.repo_of_package(package_name).ljust(max_package_name_length),
                     Colors.RED(self.all_packages_dict[package_name].version).ljust(max_left_side_version_length + 10),
-                    Colors.GREEN(new_system.all_packages_dict[package_name].version))
+                    Colors.GREEN(new_system.all_packages_dict[package_name].version)
+                )
 
                 print(string_to_print)
 
@@ -1899,8 +2167,10 @@ class System:
                 string_to_print = "   {}  {}  ->  {}".format(
                     upstream_system.repo_of_package(package_name).ljust(max_package_name_length),
                     Colors.LIGHT_MAGENTA(self.all_packages_dict[package_name].version).ljust(
-                        max_left_side_version_length + 10),
-                    Colors.LIGHT_MAGENTA(new_system.all_packages_dict[package_name].version))
+                        max_left_side_version_length + 10
+                    ),
+                    Colors.LIGHT_MAGENTA(new_system.all_packages_dict[package_name].version)
+                )
 
                 print(string_to_print)
 
@@ -1910,20 +2180,25 @@ class System:
                 string_to_print = "   {}  {}  ->  {}".format(
                     upstream_system.repo_of_package(package_name).ljust(max_package_name_length),
                     Colors.GREEN(self.all_packages_dict[package_name].version).ljust(max_left_side_version_length + 10),
-                    Colors.RED("/"))
+                    Colors.RED("/")
+                )
 
                 print(string_to_print)
 
             # print why those packages have to be uninstalled
             self.hypothetical_append_packages_to_system(solution, packages_names_print_reason=to_uninstall_names)
 
+        # check if no dependency breakage happens
+        if not solution_way:
+            self.hypothetical_append_packages_to_system(solution, check_if_possible=True)
+
         if solution_way:
             aurman_status("The following will be done:", new_line=True)
             if deep_search:
-                aurman_note("You are using {}, hence {} is active.".format(Colors.BOLD("--deep_search"),
-                                                                           Colors.BOLD("--needed")))
-                aurman_note("That means packages to be reinstalled"
-                            " will not actually be reinstalled.")
+                aurman_note("You are using {}, hence {} is active.".format(
+                    Colors.BOLD("--deep_search"), Colors.BOLD("--needed")
+                ))
+                aurman_note("That means packages to be reinstalled will not actually be reinstalled.")
             self.hypothetical_append_packages_to_system(solution, print_way=True)
 
         if not noconfirm and not ask_user(user_question, True, True):

@@ -16,9 +16,9 @@ with open(path.join(here, 'README.md'), encoding='utf-8') as f:
 setup(
     name='aurman',
 
-    version='2.9.21',  # do not forget to change this
+    version='2.18',  # do not forget to change this
 
-    python_requires='>=3.6',
+    python_requires='>=3.7',
 
     description='Arch Linux AUR helper',
 
@@ -40,5 +40,5 @@ setup(
         ]
     },
 
-    install_requires=['requests']
+    install_requires=['requests', 'regex', 'pyalpm', 'python_dateutil', 'feedparser']
 )

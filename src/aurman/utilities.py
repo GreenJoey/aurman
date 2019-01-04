@@ -1,8 +1,12 @@
 import logging
+import sys
+import termios
 import threading
 import time
+import tty
+from enum import Enum, auto
 from pyalpm import vercmp
-from subprocess import run, DEVNULL
+from subprocess import run
 from typing import Tuple, Sequence
 
 import regex
@@ -10,9 +14,23 @@ import regex
 from aurman.aur_utilities import get_aur_info
 from aurman.coloring import Colors, aurman_error, aurman_question
 from aurman.own_exceptions import InvalidInput
+from aurman.parse_args import PacmanArgs
 
 
-def search_and_print(names: Sequence[str], installed_system, pacman_params: str, repo: bool, aur: bool):
+class SudoLoop:
+    # timeout for sudo loop
+    timeout: int = 120
+
+
+class SearchSortBy(Enum):
+    # values to sort the -Ss results by
+    NAME = auto()
+    POPULARITY = auto()
+    VOTES = auto()
+
+
+def search_and_print(names: Sequence[str], installed_system, pacman_params: 'PacmanArgs',
+                     repo: bool, aur: bool, sort_by: SearchSortBy):
     """
     Searches for something and prints the results
 
@@ -21,19 +39,18 @@ def search_and_print(names: Sequence[str], installed_system, pacman_params: str,
     :param pacman_params:       parameters for pacman as string
     :param repo:                search only in repo
     :param aur:                 search only in aur
+    :param sort_by:             according to which the results are to be sorted
     """
     if not names:
         return
 
     if not aur:
-        # escape for pacman
-        to_escape = list("()+?|{}")
-        for char in to_escape:
-            pacman_params = pacman_params.replace(char, "\{}".format(char))
-
-        run("pacman {}".format(pacman_params), shell=True)
+        run(["pacman"] + pacman_params.args_as_list())
 
     if not repo:
+        if sort_by is None:
+            sort_by = SearchSortBy.POPULARITY
+
         # see: https://docs.python.org/3/howto/regex.html
         regex_chars = list("^.+*?$[](){}\|")
 
@@ -54,27 +71,44 @@ def search_and_print(names: Sequence[str], installed_system, pacman_params: str,
                     break
 
             if index_start == -1 or index_end - index_start < 2:
-                aurman_error("Your query {} "
-                             "contains not enough non regex chars!"
-                             "".format(Colors.BOLD(Colors.LIGHT_MAGENTA(name))))
-                raise InvalidInput("Your query {} "
-                                   "contains not enough non regex chars!"
-                                   "".format(Colors.BOLD(Colors.LIGHT_MAGENTA(name))))
+                aurman_error(
+                    "Your query {} contains not enough non regex chars!".format(
+                        Colors.BOLD(Colors.LIGHT_MAGENTA(name))
+                    )
+                )
+                raise InvalidInput(
+                    "Your query {} contains not enough non regex chars!".format(
+                        Colors.BOLD(Colors.LIGHT_MAGENTA(name))
+                    )
+                )
 
             names_beginnings_without_regex.append(name[index_start:index_end])
 
         found_names = set(ret_dict['Name'] for ret_dict in get_aur_info([names_beginnings_without_regex[0]], True)
                           if regex_patterns[0].findall(ret_dict['Name'])
-                          or regex_patterns[0].findall(ret_dict['Description']))
+                          or isinstance(ret_dict['Description'], str)
+                          and regex_patterns[0].findall(ret_dict['Description']))
 
         for i in range(1, len(names)):
             found_names &= set(ret_dict['Name'] for ret_dict in get_aur_info([names_beginnings_without_regex[i]], True)
                                if regex_patterns[i].findall(ret_dict['Name'])
-                               or regex_patterns[i].findall(ret_dict['Description']))
+                               or isinstance(ret_dict['Description'], str)
+                               and regex_patterns[i].findall(ret_dict['Description']))
 
         search_return = get_aur_info(found_names)
 
-        for ret_dict in sorted(search_return, key=lambda x: float(x['Popularity']), reverse=True):
+        kwargs = {}
+        if sort_by in [SearchSortBy.POPULARITY, SearchSortBy.VOTES]:
+            kwargs.update(reverse=True)
+
+        if sort_by is SearchSortBy.POPULARITY:
+            kwargs.update(key=lambda x: float(x['Popularity']))
+        elif sort_by is SearchSortBy.VOTES:
+            kwargs.update(key=lambda x: int(x['NumVotes']))
+        elif sort_by is SearchSortBy.NAME:
+            kwargs.update(key=lambda x: str(x['Name']))
+
+        for ret_dict in sorted(search_return, **kwargs):
             repo_with_slash = Colors.BOLD(Colors.LIGHT_MAGENTA("aur/"))
             name = Colors.BOLD(ret_dict['Name'])
             if ret_dict['OutOfDate'] is None:
@@ -82,10 +116,20 @@ def search_and_print(names: Sequence[str], installed_system, pacman_params: str,
             else:
                 version = Colors.BOLD(Colors.RED(ret_dict['Version']))
 
-            first_line = "{}{} {} ({}, {})".format(repo_with_slash, name, version, ret_dict['NumVotes'],
-                                                   ret_dict['Popularity'])
+            first_line = "{}{} {} ({}, {})".format(
+                repo_with_slash, name, version, ret_dict['NumVotes'], ret_dict['Popularity']
+            )
             if ret_dict['Name'] in installed_system.all_packages_dict:
-                first_line += " {}".format(Colors.BOLD(Colors.CYAN("[installed]")))
+                if version_comparison(
+                        ret_dict['Version'], "=", installed_system.all_packages_dict[ret_dict['Name']].version
+                ):
+                    first_line += " {}".format(Colors.BOLD(Colors.CYAN("[installed]")))
+                else:
+                    first_line += " {}".format(
+                        Colors.BOLD(Colors.CYAN("[installed: {}]".format(
+                            installed_system.all_packages_dict[ret_dict['Name']].version
+                        )))
+                    )
             print(first_line)
             print("    {}".format(ret_dict['Description']))
 
@@ -155,11 +199,11 @@ def acquire_sudo():
 
     def sudo_loop():
         while True:
-            if run("sudo -v", shell=True, stdout=DEVNULL).returncode != 0:
+            if run(["sudo", "--non-interactive", "-v"]).returncode != 0:
                 logging.error("acquire sudo failed")
-            time.sleep(120)
+            time.sleep(SudoLoop.timeout)
 
-    if run("sudo -v", shell=True).returncode != 0:
+    if run(["sudo", "-v"]).returncode != 0:
         logging.error("acquire sudo failed")
         raise InvalidInput("acquire sudo failed")
     t = threading.Thread(target=sudo_loop)
@@ -187,8 +231,21 @@ def ask_user(question: str, default: bool, new_line: bool = False) -> bool:
         choices = "N/y"
 
     while True:
-        user_choice = str(input(
-            aurman_question("{} {}: ".format(question, choices), new_line=new_line, to_print=False))).strip().lower()
+        print(aurman_question("{} {}: ".format(question, choices), new_line=new_line, to_print=False),
+              end='', flush=True)
+
+        # see https://stackoverflow.com/a/36974338
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+
+        try:
+            tty.setcbreak(fd)
+            answer = sys.stdin.read(1)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+        print(flush=True)
+        user_choice = answer.strip().lower()
         if user_choice in yes or user_choice in no:
             return user_choice in yes
         aurman_error("That was not a valid choice!")

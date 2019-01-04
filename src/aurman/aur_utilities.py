@@ -6,9 +6,13 @@ from urllib.parse import quote_plus
 import requests
 
 from aurman.own_exceptions import InvalidInput, ConnectionProblem
+from aurman.parsing_config import AurmanConfig
 from aurman.wrappers import split_query_helper
 
-aur_domain = "https://aur.archlinux.org"
+
+class AurVars:
+    aur_domain: str = "https://aur.archlinux.org"
+    aur_timeout: int = 5
 
 
 def get_aur_info(package_names: Sequence[str], search: bool = False, by_name: bool = False) -> List[Dict]:
@@ -24,10 +28,10 @@ def get_aur_info(package_names: Sequence[str], search: bool = False, by_name: bo
 
     max_query_length = 8000
     if not search:
-        query_url = aur_domain + "/rpc/?v=5&type=info"
+        query_url = AurVars.aur_domain + "/rpc/?v=5&type=info"
         query_prefix = "&arg[]="
     else:
-        query_url = aur_domain + "/rpc/?v=5&type=search"
+        query_url = AurVars.aur_domain + "/rpc/?v=5&type=search"
         if by_name:
             query_url += "&by=name"
         query_prefix = "&arg="
@@ -42,9 +46,17 @@ def get_aur_info(package_names: Sequence[str], search: bool = False, by_name: bo
     results_list = []
     for query_parameters in queries_parameters:
         try:
-            results_list.extend(json.loads(requests.get("{}{}".format(query_url, ''.join(
-                ["{}{}".format(query_prefix, parameter) for parameter in query_parameters])), timeout=5).text)[
-                                    'results'])
+            results_list.extend(
+                json.loads(
+                    requests.get(
+                        "{}{}".format(
+                            query_url,
+                            ''.join(["{}{}".format(query_prefix, parameter) for parameter in query_parameters])
+                        ),
+                        timeout=AurVars.aur_timeout
+                    ).text
+                )['results']
+            )
         except requests.exceptions.RequestException:
             logging.error("Connection problem while requesting AUR info for {}".format(package_names), exc_info=True)
             raise ConnectionProblem("Connection problem while requesting AUR info for {}".format(package_names))
@@ -68,5 +80,9 @@ def is_devel(name: str) -> bool:
     for develending in develendings:
         if name.endswith("-{}".format(develending)):
             return True
+
+    # devel packages names specified in the aurman config
+    if 'devel_packages' in AurmanConfig.aurman_config:
+        return name in AurmanConfig.aurman_config['devel_packages']
 
     return False

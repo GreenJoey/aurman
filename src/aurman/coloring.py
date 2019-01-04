@@ -1,11 +1,27 @@
+from sys import stdout
+
+from pycman.config import PacmanConfig
+
+
 class Colors:
     """
     Class used for colored output
     """
 
+    # pacman --color equivalent
+    # 0 = auto, 1 = always, 2 = never
+    if PacmanConfig("/etc/pacman.conf").options.get('Color', False) is True:
+        color = 0
+    else:
+        color = 2
+
     @staticmethod
     def concat_str(*args):
-        return ''.join([str(arg) for arg in args])
+        # check whether to use colors, bold etc. or not
+        if Colors.color == 1 or Colors.color == 0 and stdout.isatty():
+            return ''.join([str(arg) for arg in args])
+        else:
+            return ''.join([str(arg) for arg in args[1:-1]])
 
     @staticmethod
     def strip_colors(string: str) -> str:

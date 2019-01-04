@@ -1,7 +1,6 @@
 import configparser
 import logging
 import os
-from subprocess import run, DEVNULL
 from typing import Tuple, Set, Dict
 
 from aurman.coloring import aurman_error, Colors
@@ -19,20 +18,23 @@ def read_config() -> 'configparser.ConfigParser':
     :return:    The aurman config
     """
     # config dir
-    config_dir = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser(os.path.join("~", ".config"))),
-                              "aurman")
+    config_dir = os.path.join(
+        os.environ.get("XDG_CONFIG_HOME", os.path.expanduser(os.path.join("~", ".config"))),
+        "aurman"
+    )
     config_file = os.path.join(config_dir, "aurman_config")
 
     # create config dir if it does not exist
     if not os.path.exists(config_dir):
-        if run("install -dm700 '{}'".format(config_dir), shell=True, stdout=DEVNULL, stderr=DEVNULL).returncode != 0:
-            logging.error("Creating config dir of aurman failed")
-            raise InvalidInput("Creating config dir of aurman failed")
+        try:
+            os.makedirs(config_dir, mode=0o700, exist_ok=True)
+        except OSError:
+            logging.error("Creating config dir of aurman {} failed".format(config_dir))
+            raise InvalidInput("Creating config dir of aurman {} failed".format(config_dir))
 
     # create empty config if config does not exist
     if not os.path.isfile(config_file):
-        with open(config_file, 'w') as configfile:
-            configfile.write("")
+        open(config_file, 'a').close()
 
     config = configparser.ConfigParser(allow_no_value=True)
     # make the config case sensitive
